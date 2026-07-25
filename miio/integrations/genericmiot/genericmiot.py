@@ -1,11 +1,14 @@
 import logging
 from functools import partial
-from typing import TypeVar
+from pathlib import Path
+from typing import TypeVar, cast
 
 import attr
+import click
+import yaml
 
 from miio import MiotDevice
-from miio.click_common import command
+from miio.click_common import command, format_output
 from miio.descriptors import AccessFlags, ActionDescriptor, PropertyDescriptor
 from miio.miot_cloud import MiotCloud
 from miio.miot_device import MiotMapping
@@ -89,7 +92,7 @@ class GenericMiot(MiotDevice):
         access the raw device-given name if needed.
         """
         meta = self._meta.get_metadata(entity)
-        if meta is None or meta.description == desc.name:
+        if meta is None or meta.description is None or meta.description == desc.name:
             return desc
 
         _LOGGER.debug("Renamed %s to %s", desc.name, meta.description)
@@ -120,6 +123,7 @@ class GenericMiot(MiotDevice):
             if prop.access == [MiotAccess.Notify]:
                 _LOGGER.debug("Skipping notify-only property: %s", prop)
                 continue
+
             if not prop.access:
                 # some properties are defined only to be used as inputs or outputs for actions
                 _LOGGER.debug(
@@ -180,6 +184,99 @@ class GenericMiot(MiotDevice):
         if self._miot_model is not None:
             return self._miot_model.urn.type
         return None
+
+    @command(
+        click.option(
+            "--output-dir",
+            type=click.Path(file_okay=False),
+            default=None,
+            help="Write one YAML file per namespace to this directory.",
+        ),
+        default_output=format_output("", ""),
+    )
+    def metadata(self, output_dir: str | None = None):
+        """Show metadata coverage and optionally generate YAML templates for missing items."""
+        if not self._initialized:
+            self._initialize_descriptors()
+
+        miot_model = cast(DeviceModel, self._miot_model)
+
+        for serv in miot_model.services:
+            if serv.siid == 1:
+                continue
+
+            click.echo(f"\n{serv}")
+            ns_name = serv.urn.namespace
+            nd_lines: list[str] = []
+            for entity in [*serv.properties, *serv.actions]:
+                direct = self._meta.lookup_in_namespace(
+                    ns_name, serv.name, entity.urn.type, entity.urn.name
+                )
+                if direct:
+                    if direct.description is None:
+                        nd_lines.append(
+                            f"  [??] {entity!s:50}  (fill in description if known)"
+                        )
+                    else:
+                        click.echo(f"  [ok] {entity!s:50} -> {direct}")
+                    continue
+
+                fallback = self._meta.get_metadata(entity)
+                if fallback:
+                    if fallback.description is None:
+                        nd_lines.append(
+                            f"  [??] {entity!s:50}  (fill in description if known)"
+                        )
+                    else:
+                        click.echo(
+                            f"  [fb] {entity!s:50} -> {fallback} ({fallback.source})"
+                        )
+                else:
+                    click.echo(f"  [--] {entity!s:50} {entity.description!r}")
+
+            for line in nd_lines:
+                click.echo(line)
+
+        cov = self._meta.collect_coverage(miot_model)
+
+        click.echo(
+            f"\nCoverage: {cov.ok} ok, {cov.fb} via fallback, "
+            f"{cov.no_desc} without description, {cov.missing} missing "
+            f"(total {cov.total})"
+        )
+
+        if not cov.missing_by_ns:
+            if cov.no_desc:
+                click.echo(
+                    f"{cov.no_desc} entries lack a description "
+                    "- fill them in if you know what they are."
+                )
+            else:
+                click.echo("All entities are covered.")
+            return
+
+        for ns_name, services in cov.missing_by_ns.items():
+            ns_meta = self._meta.build_namespace_metadata(ns_name, services)
+            suggested = self._meta.suggested_filename(ns_name)
+
+            if output_dir is not None:
+                out = Path(output_dir) / suggested
+                created = self._meta.write_namespace_metadata(ns_meta, out)
+                click.echo(f"{'Written' if created else 'Updated'}: {out}")
+                base_file = Path(output_dir) / "base.yaml"
+                if base_file.exists():
+                    if self._meta.register_namespace(ns_name, suggested, base_file):
+                        click.echo(f"Registered in {base_file}")
+            else:
+                click.echo(f"\n--- {ns_name} (save as {suggested}) ---")
+                click.echo(
+                    yaml.dump(
+                        ns_meta.model_dump(exclude_defaults=True),
+                        default_flow_style=False,
+                        sort_keys=False,
+                        allow_unicode=True,
+                    )
+                )
 
     @classmethod
     def get_device_group(cls):
